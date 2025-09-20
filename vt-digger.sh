@@ -5,9 +5,6 @@
 # by Mihir Limbad (0xAshura)
 # =====================================================
 
-# VirusTotal Subdomain Extractor for Free API
-# Respects limits: 4 requests/min, 500 requests/day, 15.5K requests/month
-
 # Default values
 API_KEYS=()
 DOMAINS=()
@@ -16,6 +13,8 @@ SUBDOMAINS_ONLY=false
 REQUEST_DELAY=15
 VERBOSE=false
 MAX_REQUESTS_PER_KEY=500
+RECURSIVE=false
+declare -A PROCESSED_DOMAINS
 
 # Colors for output
 RED='\033[0;31m'
@@ -30,7 +29,7 @@ NC='\033[0m' # No Color
 print_banner() {
     echo -e "${MAGENTA}"
     echo " ██╗   ██╗████████╗   ██████╗ ██╗ ██████╗  ██████╗ ███████╗██████╗   "
-    echo " ██║   ██║╚══██╔══╝   ██╔══██╗██║██╔════╝ ██╔════╝ ██╔════╝██╔══██╗  "
+    echo " ██╗   ██║╚══██╔══╝   ██╔══██╗██║██╔════╝ ██╔════╝ ██╔════╝██╔══██╗  "
     echo " ██║   ██║   ██║█████╗██║  ██║██║██║  ███╗██║  ███╗█████╗  ██████╔╝  "
     echo " ╚██╗ ██╔╝   ██║╚════╝██║  ██║██║██║   ██║██║   ██║██╔══╝  ██╔══██╗  "
     echo " ╚██╗ ██╔╝   ██║╚════╝██║  ██║██║██║   ██║██║   ██║██╔══╝  ██╔══██╗  "
@@ -52,6 +51,7 @@ usage() {
     echo "  -k, --keys FILE            File containing API keys (one per line)"
     echo "  -o, --output FILE          Output file (default: vt_subdomains.txt)"
     echo "  -s, --subdomains-only      Output only subdomains without the root domain"
+    echo "  -r, --recursive            Enable recursive subdomain enumeration"
     echo "  -D, --delay SECONDS        Delay between requests (default: 15)"
     echo "  -v, --verbose              Enable verbose output"
     echo "  -h, --help                 Show this help message"
@@ -125,6 +125,10 @@ while [[ $# -gt 0 ]]; do
             SUBDOMAINS_ONLY=true
             shift
             ;;
+        -r|--recursive)
+            RECURSIVE=true
+            shift
+            ;;
         -D|--delay)
             REQUEST_DELAY="$2"
             shift 2
@@ -179,6 +183,7 @@ log "Domains to process: ${#DOMAINS[@]}"
 log "API keys available: ${#API_KEYS[@]}"
 log "Maximum requests per key: $MAX_REQUESTS_PER_KEY"
 log "Minimum delay between requests: ${REQUEST_DELAY}s"
+log "Recursive mode: $RECURSIVE"
 
 # Function to get the next available API key
 get_next_key() {
@@ -222,85 +227,138 @@ get_next_key() {
     get_next_key
 }
 
-# Process each domain
-for DOMAIN in "${DOMAINS[@]}"; do
-    section "Processing domain: $DOMAIN"
+# Function to process a domain with all its pages
+process_domain() {
+    local domain="$1"
+    local next_url="${2:-null}"
+    local page="${3:-1}"
     
-    # Initialize variables for this domain
-    NEXT_URL="null"
-    PAGE=1
-    DOMAIN_SUBS=0
-    URL="https://www.virustotal.com/api/v3/domains/$DOMAIN/relationships/subdomains"
+    # Get next available API key
+    API_KEY=$(get_next_key)
+    if [ -z "$API_KEY" ]; then
+        error "No available API keys with remaining quota for $domain"
+        return 1
+    fi
     
-    # Process all pages for this domain
-    while true; do
-        # Get next available API key
-        API_KEY=$(get_next_key)
-        if [ -z "$API_KEY" ]; then
-            error "No available API keys with remaining quota."
-            break 2
-        fi
-        
-        # Update request count and time
-        REQUESTS_PER_KEY["$API_KEY"]=$((REQUESTS_PER_KEY["$API_KEY"] + 1))
-        LAST_REQUEST_TIME["$API_KEY"]=$(date +%s)
-        TOTAL_REQUESTS=$((TOTAL_REQUESTS + 1))
-        
-        log "Fetching page $PAGE for $DOMAIN (Request #${TOTAL_REQUESTS})"
-        log "Using API key ${KEY_INDEX} with ${REQUESTS_PER_KEY["$API_KEY"]}/$MAX_REQUESTS_PER_KEY requests"
-        
-        if [ "$NEXT_URL" = "null" ]; then
-            # First page request
-            RESPONSE=$(curl -s -H "accept: application/json" -H "x-apikey: $API_KEY" "$URL?limit=40")
+    # Update request count and time
+    REQUESTS_PER_KEY["$API_KEY"]=$((REQUESTS_PER_KEY["$API_KEY"] + 1))
+    LAST_REQUEST_TIME["$API_KEY"]=$(date +%s)
+    TOTAL_REQUESTS=$((TOTAL_REQUESTS + 1))
+    
+    # Build the URL
+    if [ "$next_url" = "null" ]; then
+        URL="https://www.virustotal.com/api/v3/domains/$domain/relationships/subdomains?limit=40"
+    else
+        URL="$next_url"
+    fi
+    
+    log "Fetching page $page for $domain (Request #${TOTAL_REQUESTS})"
+    log "Using API key ${KEY_INDEX} with ${REQUESTS_PER_KEY["$API_KEY"]}/$MAX_REQUESTS_PER_KEY requests"
+    
+    # Make API request
+    RESPONSE=$(curl -s -H "accept: application/json" -H "x-apikey: $API_KEY" "$URL")
+    
+    # Check if we got a valid response
+    if echo "$RESPONSE" | jq -e '.data' > /dev/null 2>&1; then
+        # Extract subdomains
+        if [ "$SUBDOMAINS_ONLY" = true ]; then
+            # Extract only the subdomain part (before the domain)
+            SUBS=$(echo "$RESPONSE" | jq -r '.data[].id' | sed "s/\.$domain\$//")
         else
-            # Subsequent pages
-            RESPONSE=$(curl -s -H "accept: application/json" -H "x-apikey: $API_KEY" "$NEXT_URL")
+            # Extract full subdomains
+            SUBS=$(echo "$RESPONSE" | jq -r '.data[].id')
         fi
+        
+        # Count and append to output file
+        SUBS_COUNT=$(echo "$SUBS" | grep -c -v '^$')
+        if [ $SUBS_COUNT -gt 0 ]; then
+            echo "$SUBS" >> "$OUTPUT_FILE"
+            log "Found $SUBS_COUNT subdomains on page $page"
+        fi
+        
+        # Get next URL
+        NEXT_URL=$(echo "$RESPONSE" | jq -r '.links.next')
+        
+        # Check if we have more pages
+        if [ "$NEXT_URL" != "null" ] && [ -n "$NEXT_URL" ]; then
+            log "Found next page for $domain"
+            process_domain "$domain" "$NEXT_URL" "$((page + 1))"
+        fi
+        
+        return 0
+    else
+        error "Invalid response for $domain, page $page"
+        # Check if we hit rate limits
+        if echo "$RESPONSE" | jq -e '.error.code == "QuotaExceededError"' > /dev/null 2>&1; then
+            error "API key ${KEY_INDEX} has exceeded its quota."
+            REQUESTS_PER_KEY["$API_KEY"]=$MAX_REQUESTS_PER_KEY
+        else
+            echo "$RESPONSE" | jq . 2>/dev/null || echo "$RESPONSE"
+        fi
+        return 1
+    fi
+}
 
-        # Check if we got a valid response
-        if echo "$RESPONSE" | jq -e '.data' > /dev/null 2>&1; then
-            # Extract subdomains
-            if [ "$SUBDOMAINS_ONLY" = true ]; then
-                # Extract only the subdomain part (before the domain)
-                SUBS=$(echo "$RESPONSE" | jq -r '.data[].id' | sed "s/\.$DOMAIN\$//")
-            else
-                # Extract full subdomains
-                SUBS=$(echo "$RESPONSE" | jq -r '.data[].id')
-            fi
-            
-            # Count and append to output file
-            SUBS_COUNT=$(echo "$SUBS" | grep -c -v '^$')
-            if [ $SUBS_COUNT -gt 0 ]; then
-                echo "$SUBS" >> "$OUTPUT_FILE"
-                DOMAIN_SUBS=$((DOMAIN_SUBS + SUBS_COUNT))
-                log "Found $SUBS_COUNT subdomains on page $PAGE"
-            fi
-            
-            # Get next URL
-            NEXT_URL=$(echo "$RESPONSE" | jq -r '.links.next')
-            
-            # Check if we have more pages
-            if [ "$NEXT_URL" = "null" ]; then
-                break
-            fi
-            
-            PAGE=$((PAGE + 1))
-        else
-            error "Invalid response for $DOMAIN, page $PAGE"
-            # Check if we hit rate limits
-            if echo "$RESPONSE" | jq -e '.error.code == "QuotaExceededError"' > /dev/null 2>&1; then
-                error "API key ${KEY_INDEX} has exceeded its quota."
-                REQUESTS_PER_KEY["$API_KEY"]=$MAX_REQUESTS_PER_KEY
-            else
-                echo "$RESPONSE" | jq . 2>/dev/null || echo "$RESPONSE"
-            fi
-            break
+# Function to check if a domain is a subdomain of any target
+is_subdomain() {
+    local domain="$1"
+    for target in "${DOMAINS[@]}"; do
+        if [[ "$domain" == *".$target" ]]; then
+            return 0
         fi
     done
-    
-    TOTAL_SUBDOMAINS=$((TOTAL_SUBDOMAINS + DOMAIN_SUBS))
-    success "Found $DOMAIN_SUBS subdomains for $DOMAIN"
+    return 1
+}
+
+# Phase 1: Process all main domains
+for DOMAIN in "${DOMAINS[@]}"; do
+    section "Processing domain: $DOMAIN"
+    process_domain "$DOMAIN"
+    PROCESSED_DOMAINS["$DOMAIN"]=1
 done
+
+# Phase 2: If recursive mode is enabled, process discovered subdomains
+if [ "$RECURSIVE" = true ]; then
+    section "Starting recursive enumeration"
+    
+    # Read all discovered subdomains from the output file
+    mapfile -t DISCOVERED_SUBDOMAINS < "$OUTPUT_FILE"
+    
+    # Remove duplicates and sort
+    UNIQUE_SUBDOMAINS=($(printf "%s\n" "${DISCOVERED_SUBDOMAINS[@]}" | sort -u))
+    
+    log "Found ${#UNIQUE_SUBDOMAINS[@]} unique subdomains for recursive processing"
+    
+    # Process each unique subdomain that hasn't been processed yet
+    for SUBDOMAIN in "${UNIQUE_SUBDOMAINS[@]}"; do
+        # For subdomains-only mode, we need to reconstruct the full domain
+        if [ "$SUBDOMAINS_ONLY" = true ]; then
+            # Find which target domain this subdomain belongs to
+            for TARGET in "${DOMAINS[@]}"; do
+                if [[ "$SUBDOMAIN" == *".$TARGET" ]]; then
+                    # This is already a full domain
+                    FULL_DOMAIN="$SUBDOMAIN"
+                    break
+                else
+                    # This is just the subdomain part, need to reconstruct
+                    FULL_DOMAIN="$SUBDOMAIN.$TARGET"
+                fi
+            done
+        else
+            FULL_DOMAIN="$SUBDOMAIN"
+        fi
+        
+        # Check if we should process this domain
+        if [ -z "${PROCESSED_DOMAINS[$FULL_DOMAIN]}" ] && is_subdomain "$FULL_DOMAIN"; then
+            section "Processing subdomain: $FULL_DOMAIN"
+            process_domain "$FULL_DOMAIN"
+            PROCESSED_DOMAINS["$FULL_DOMAIN"]=1
+        fi
+    done
+fi
+
+# Count total subdomains
+TOTAL_SUBDOMAINS=$(wc -l < "$OUTPUT_FILE" | tr -d ' ')
 
 # Print summary
 section "Enumeration Complete"
