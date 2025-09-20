@@ -44,6 +44,7 @@ chmod +x vt-digger.sh
 | `-k, --keys FILE` | File containing API keys (one per line) |
 | `-o, --output FILE` | Output file (default: vt_subdomains.txt) |
 | `-s, --subdomains-only` | Output only prefix of subdomains |
+| `-r, --recursive` | Enable recursive subdomain enumeration |
 | `-D, --delay SECONDS` | Delay between requests (default: 15) |
 | `-v, --verbose` | Enable verbose output |
 | `-h, --help` | Show this help message |
@@ -67,7 +68,12 @@ chmod +x vt-digger.sh
 
 4. **Verbose mode with custom delay**:
    ```bash
-   ./vt-digger.sh -d example.com -k api_keys.txt -v -D 10
+   ./vt-digger.sh -d example.com -k api_keys.txt -v -D 20
+   ```
+
+5. **Recursive mode with custom delay**:
+   ```bash
+   ./vt-digger.sh -d example.com -k api_keys.txt -r -D 20
    ```
 
 ##  Configuration
